@@ -1,0 +1,929 @@
+name: Collection and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: Per-mask adaptive response cap from 1 to 300
+        required: true
+        default: 300
+        type: number
+      request_limit:
+        description: Global HTTP attempt cap from 1 to 9000
+        required: true
+        default: 5000
+        type: number
+      deep_scan:
+        description: Continue sampling warm masks after repeat-pool saturation
+        required: false
+        default: false
+        type: boolean
+      masks:
+        description: Optional comma-separated mask override, for example 1111,2222,3322
+        required: false
+        default: ""
+        type: string
+      skip_collection:
+        description: Reuse a prior collection artifact instead of calling the endpoint
+        required: false
+        default: false
+        type: boolean
+      collection_artifact:
+        description: Exact artifact name required when collection is skipped
+        required: false
+        default: ""
+        type: string
+  schedule:
+    - cron: "10 10 * * *"
+      timezone: "Asia/Tokyo"
+
+permissions: {}
+
+concurrency:
+  group: raku-mobi-bangou-release
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    permissions:
+      actions: read
+      contents: read
+
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      run-artifact: ${{ steps.metadata.outputs.run-artifact }}
+      specialized: ${{ steps.metadata.outputs.specialized }}
+      rounds: ${{ steps.reuse-collection.outputs.rounds || steps.metadata.outputs.rounds }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Initialize run metadata and diagnostics
+        id: metadata
+        env:
+          COLLECTION_ARTIFACT: ${{ inputs.collection_artifact || '' }}
+          INPUT_DEEP_SCAN: ${{ inputs.deep_scan || false }}
+          MASK_OVERRIDE: ${{ inputs.masks || '' }}
+          INPUT_REQUEST_LIMIT: ${{ inputs.request_limit }}
+          INPUT_ROUNDS: ${{ inputs.rounds }}
+          SKIP_COLLECTION: ${{ inputs.skip_collection || false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$(TZ=Asia/Tokyo date '+%Y-%m-%d_%H-%M')"
+          archive="raku-mobi-bangou_${tag}_csv.zip"
+          run_artifact="raku-mobi-bangou-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p run/logs
+          : > run/logs/collector.log
+          : > run/logs/errors.log
+
+          rounds=300
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            rounds="${INPUT_ROUNDS}"
+          fi
+          if ! [[ "${rounds}" =~ ^[1-9][0-9]*$ ]] || [[ "${#rounds}" -gt 3 ]]; then
+            echo "Rounds must be an integer from 1 to 300." >&2
+            exit 1
+          fi
+          if (( rounds > 300 )); then
+            echo "Rounds must be an integer from 1 to 300." >&2
+            exit 1
+          fi
+
+          request_limit=5000
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            request_limit="${INPUT_REQUEST_LIMIT:-5000}"
+          fi
+          if ! [[ "${request_limit}" =~ ^[1-9][0-9]*$ ]] \
+            || [[ "${#request_limit}" -gt 4 ]] \
+            || (( request_limit > 9000 )); then
+            echo "Request limit must be an integer from 1 to 9000." >&2
+            exit 1
+          fi
+
+          deep_scan=false
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            deep_scan="${INPUT_DEEP_SCAN:-false}"
+          fi
+          if [[ "${deep_scan}" != "true" && "${deep_scan}" != "false" ]]; then
+            echo "Deep scan must be true or false." >&2
+            exit 1
+          fi
+
+          reuse=false
+          source_run_id=""
+          source_artifact=""
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" \
+            && "${SKIP_COLLECTION:-false}" == "true" ]]; then
+            reuse=true
+            source_artifact="${COLLECTION_ARTIFACT:-}"
+            if [[ "${source_artifact}" =~ ^raku-mobi-bangou-run-([1-9][0-9]*)-([1-9][0-9]*)$ ]]; then
+              source_run_id="${BASH_REMATCH[1]}"
+            else
+              echo "Collection artifact must look like raku-mobi-bangou-run-RUN_ID-ATTEMPT." >&2
+              exit 1
+            fi
+          elif [[ -n "${COLLECTION_ARTIFACT:-}" ]]; then
+            echo "Enable skip_collection before specifying collection_artifact." >&2
+            exit 1
+          fi
+
+          specialized=false
+          run_kind="scheduled_full"
+          if [[ "${GITHUB_EVENT_NAME}" != "schedule" ]]; then
+            run_kind="manual_full"
+          fi
+          cache_scope="full"
+          if [[ -n "${MASK_OVERRIDE//[[:space:]]/}" ]]; then
+            specialized=true
+            run_kind="manual_specialized"
+            declare -A seen=()
+            selected=()
+            remaining="${MASK_OVERRIDE}"
+            while true; do
+              if [[ "${remaining}" == *,* ]]; then
+                raw_mask="${remaining%%,*}"
+                remaining="${remaining#*,}"
+                has_more=true
+              else
+                raw_mask="${remaining}"
+                has_more=false
+              fi
+              mask="${raw_mask#"${raw_mask%%[![:space:]]*}"}"
+              mask="${mask%"${mask##*[![:space:]]}"}"
+              if ! [[ "${mask}" =~ ^[0-9]{4}$ ]]; then
+                echo "Invalid mask override item: ${raw_mask@Q}" >&2
+                exit 1
+              fi
+              if [[ -n "${seen[${mask}]+present}" ]]; then
+                echo "Duplicate mask override: ${mask}" >&2
+                exit 1
+              fi
+              seen["${mask}"]=1
+              selected+=("${mask}")
+              if (( ${#selected[@]} > 20 )); then
+                echo "A specialized run accepts at most 20 masks." >&2
+                exit 1
+              fi
+              if [[ "${has_more}" != "true" ]]; then
+                break
+              fi
+            done
+            mapfile -t selected < <(printf '%s\n' "${selected[@]}" | LC_ALL=C sort)
+            printf '%s\n' "${selected[@]}" > run/selected_masks.txt
+            scope_digest="$(printf '%s\n' "${selected[@]}" | sha256sum | cut -d' ' -f1)"
+            cache_scope="specialized-${scope_digest}"
+          fi
+          csv_dir="state/scopes/${cache_scope}/csv"
+          run_key="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          evidence_date="$(TZ=Asia/Tokyo date '+%Y-%m-%d')"
+
+          {
+            echo "tag=${tag}"
+            echo "archive=${archive}"
+            echo "run-artifact=${run_artifact}"
+            echo "specialized=${specialized}"
+            echo "csv_dir=${csv_dir}"
+            echo "cache_scope=${cache_scope}"
+            echo "rounds=${rounds}"
+            echo "request-limit=${request_limit}"
+            echo "deep-scan=${deep_scan}"
+            echo "run-kind=${run_kind}"
+            echo "run-key=${run_key}"
+            echo "evidence-date=${evidence_date}"
+            echo "reuse=${reuse}"
+            echo "source-run-id=${source_run_id}"
+            echo "source-artifact=${source_artifact}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Restore collection state cache
+        id: state-cache
+        if: ${{ steps.metadata.outputs.reuse != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: state
+          key: raku-mobi-bangou-state-v3-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            raku-mobi-bangou-state-v3-
+
+      - name: Normalize collection state
+        if: ${{ steps.metadata.outputs.reuse != 'true' }}
+        env:
+          CSV_DIR: ${{ steps.metadata.outputs.csv_dir }}
+          MATCHED_KEY: ${{ steps.state-cache.outputs.cache-matched-key }}
+          RESTORE_OUTCOME: ${{ steps.state-cache.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_is_valid=false
+          if [[ "${RESTORE_OUTCOME}" == "success" && -n "${MATCHED_KEY}" ]]; then
+            if python3 ci/state_cache.py validate --state-dir state; then
+              cache_is_valid=true
+            else
+              echo "Restored state cache is invalid; starting from an empty state." >&2
+            fi
+          fi
+          if [[ "${cache_is_valid}" != "true" ]]; then
+            rm -rf -- state
+          fi
+          mkdir -p "${CSV_DIR}"
+
+      - name: Collect phone-number candidates
+        id: collect
+        if: ${{ steps.metadata.outputs.reuse != 'true' }}
+        continue-on-error: true
+        env:
+          PHONE_NUMBER_API_URL: ${{ secrets.PHONE_NUMBER_API_URL }}
+          DEEP_SCAN: ${{ steps.metadata.outputs.deep-scan }}
+          REQUEST_LIMIT: ${{ steps.metadata.outputs.request-limit }}
+          ROUNDS: ${{ steps.metadata.outputs.rounds }}
+          SPECIALIZED: ${{ steps.metadata.outputs.specialized }}
+          CACHE_SCOPE: ${{ steps.metadata.outputs.cache_scope }}
+          CSV_DIR: ${{ steps.metadata.outputs.csv_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline_args=()
+          baseline_csv="state/scopes/${CACHE_SCOPE}/all_numbers.csv"
+          if [[ -s "${baseline_csv}" ]]; then
+            baseline_args=(--baseline-csv "${baseline_csv}")
+          fi
+          lifecycle_args=()
+          if [[ -s state/lifecycle.csv ]]; then
+            lifecycle_args=(--lifecycle-csv state/lifecycle.csv)
+          fi
+          scan_history_args=()
+          scan_history_csv="state/scopes/${CACHE_SCOPE}/scan_history.csv"
+          if [[ -s "${scan_history_csv}" ]]; then
+            scan_history_args=(--scan-history "${scan_history_csv}")
+          fi
+          deep_scan_args=()
+          if [[ "${DEEP_SCAN}" == "true" ]]; then
+            deep_scan_args=(--deep-scan)
+          fi
+          mask_args=()
+          if [[ "${SPECIALIZED}" == "true" ]]; then
+            test -s run/selected_masks.txt
+            mapfile -t mask_args < run/selected_masks.txt
+          fi
+          python3 raku-mobi-bangou.py "${mask_args[@]}" \
+            --rounds "${ROUNDS}" \
+            --target-coverage 0.90 \
+            --request-limit "${REQUEST_LIMIT}" \
+            --mask-cooldown 30 \
+            "${deep_scan_args[@]}" \
+            --output-dir "${CSV_DIR}" \
+            --run-dir run \
+            "${baseline_args[@]}" \
+            "${lifecycle_args[@]}" \
+            "${scan_history_args[@]}"
+
+      - name: Update cumulative catalog
+        id: catalog
+        if: ${{ steps.collect.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          EVIDENCE_DATE: ${{ steps.metadata.outputs.evidence-date }}
+          RUN_KEY: ${{ steps.metadata.outputs.run-key }}
+          RUN_KIND: ${{ steps.metadata.outputs.run-kind }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          history_args=()
+          if [[ -s state/catalog.csv ]]; then
+            history_args=(--previous state/catalog.csv)
+          fi
+          lifecycle_args=()
+          if [[ -s state/lifecycle.csv ]]; then
+            lifecycle_args=(--previous-lifecycle state/lifecycle.csv)
+          fi
+          mask_days_args=()
+          if [[ -s state/mask_days.csv ]]; then
+            mask_days_args=(--previous-mask-days state/mask_days.csv)
+          fi
+          events_args=()
+          if [[ -s state/lifecycle_events.csv ]]; then
+            events_args=(--previous-events state/lifecycle_events.csv)
+          fi
+          observed_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          python3 ci/catalog.py \
+            --current run/all_numbers.csv \
+            --coverage-pool run/coverage_pool.csv \
+            --mask-summary run/mask_summary.csv \
+            --observed-at "${observed_at}" \
+            --evidence-date "${EVIDENCE_DATE}" \
+            --run-key "${RUN_KEY}" \
+            --run-kind "${RUN_KIND}" \
+            "${history_args[@]}" \
+            "${lifecycle_args[@]}" \
+            "${mask_days_args[@]}" \
+            "${events_args[@]}" \
+            --catalog-output run/catalog.csv \
+            --lifecycle-output run/lifecycle.csv \
+            --mask-days-output run/mask_days.csv \
+            --events-output run/lifecycle_events.csv \
+            --summary-output run/catalog_summary.json
+
+      - name: Download reused collection artifact
+        id: download-reused-collection
+        if: ${{ steps.metadata.outputs.reuse == 'true' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ steps.metadata.outputs.source-artifact }}
+          path: reused
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.metadata.outputs.source-run-id }}
+
+      - name: Validate reused collection artifact
+        id: reuse-collection
+        if: ${{ steps.metadata.outputs.reuse == 'true' && steps.download-reused-collection.outcome == 'success' }}
+        env:
+          SPECIALIZED: ${{ steps.metadata.outputs.specialized }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for required_path in \
+            reused/all_numbers.csv \
+            reused/catalog.csv \
+            reused/catalog_summary.json \
+            reused/coverage_pool.csv \
+            reused/diff.csv \
+            reused/diff_summary.json \
+            reused/lifecycle.csv \
+            reused/lifecycle_events.csv \
+            reused/mask_days.csv \
+            reused/mask_summary.csv \
+            reused/scan_history.csv \
+            reused/summary.json \
+            reused/logs/collector.log \
+            reused/logs/errors.log; do
+            if [[ ! -f "${required_path}" ]]; then
+              echo "Reused collection artifact is incomplete: ${required_path}" >&2
+              exit 1
+            fi
+          done
+
+          if [[ "${SPECIALIZED}" == "true" ]]; then
+            test -s run/selected_masks.txt
+            test -s reused/selected_masks.txt
+            cmp -- run/selected_masks.txt reused/selected_masks.txt
+          elif [[ -e reused/selected_masks.txt ]]; then
+            echo "A specialized collection artifact cannot be reused as a full scan." >&2
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import csv
+          import json
+          import os
+          from pathlib import Path
+
+          summary = json.loads(
+              Path("reused/summary.json").read_text(encoding="utf-8")
+          )
+          if summary.get("status") != "success" or summary.get("exitCode") != 0:
+              raise SystemExit("collection artifact does not represent a successful run")
+          with Path("reused/mask_summary.csv").open(
+              "r", encoding="utf-8", newline=""
+          ) as handle:
+              limits = {row.get("roundLimit") for row in csv.DictReader(handle)}
+          if len(limits) != 1:
+              raise SystemExit("collection artifact has inconsistent round limits")
+          rounds = limits.pop()
+          if rounds is None or not rounds.isdigit() or not 1 <= int(rounds) <= 300:
+              raise SystemExit("collection artifact has an invalid round limit")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"rounds={rounds}\n")
+          PY
+
+          cp -a -- reused/. run/
+
+      - name: Package CSV run
+        id: package
+        if: ${{ always() && !cancelled() && steps.metadata.outcome == 'success' && steps.metadata.outputs.reuse != 'true' }}
+        env:
+          ARCHIVE: ${{ steps.metadata.outputs.archive }}
+          COLLECTION_OUTCOME: ${{ steps.collect.outcome }}
+          CATALOG_OUTCOME: ${{ steps.catalog.outcome }}
+          CSV_DIR: ${{ steps.metadata.outputs.csv_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          require_nonempty_file() {
+            local required_path="$1"
+            if [[ ! -f "${required_path}" || ! -s "${required_path}" ]]; then
+              echo "Required run artifact is missing or empty: ${required_path}" >&2
+              return 1
+            fi
+          }
+
+          csv_files=("${CSV_DIR}"/[0-9][0-9][0-9][0-9].csv)
+          if [[ "${#csv_files[@]}" -gt 0 ]]; then
+            for csv_file in "${csv_files[@]}"; do
+              require_nonempty_file "${csv_file}"
+            done
+            archive_root="${CSV_DIR%/csv}"
+            archive_path="${GITHUB_WORKSPACE}/run/${ARCHIVE}"
+            (
+              cd "${archive_root}"
+              zip -q "${archive_path}" csv/[0-9][0-9][0-9][0-9].csv
+            )
+            zip -T "run/${ARCHIVE}" >/dev/null
+            read -r archive_entry_count archive_csv_count < <(
+              zipinfo -1 "run/${ARCHIVE}" |
+                awk '{ total++ } /^csv\/[0-9][0-9][0-9][0-9]\.csv$/ { csv++ } END { print total + 0, csv + 0 }'
+            )
+            test "${archive_entry_count}" -eq "${#csv_files[@]}"
+            test "${archive_csv_count}" -eq "${#csv_files[@]}"
+          fi
+          if [[ "${COLLECTION_OUTCOME}" == "success" ]]; then
+            test "${#csv_files[@]}" -gt 0
+            for required_path in \
+              "run/${ARCHIVE}" \
+              run/all_numbers.csv \
+              run/coverage_pool.csv \
+              run/diff.csv \
+              run/diff_summary.json \
+              run/summary.json \
+              run/mask_summary.csv \
+              run/scan_history.csv \
+              run/logs/collector.log; do
+              require_nonempty_file "${required_path}"
+            done
+            if [[ ! -f run/logs/errors.log ]]; then
+              echo "Required run artifact is missing: run/logs/errors.log" >&2
+              exit 1
+            fi
+          fi
+          if [[ "${CATALOG_OUTCOME}" == "success" ]]; then
+            for required_path in \
+              run/catalog.csv \
+              run/lifecycle.csv \
+              run/mask_days.csv \
+              run/lifecycle_events.csv \
+              run/catalog_summary.json; do
+              require_nonempty_file "${required_path}"
+            done
+          fi
+
+      - name: Upload run artifact
+        id: upload-run
+        if: ${{ always() && steps.metadata.outcome == 'success' && (steps.metadata.outputs.reuse != 'true' || steps.reuse-collection.outcome == 'success') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.metadata.outputs.run-artifact }}
+          path: run/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Stage collection state cache
+        id: stage-state
+        if: ${{ always() && steps.metadata.outputs.reuse != 'true' && steps.collect.outcome == 'success' && steps.catalog.outcome == 'success' && steps.package.outcome == 'success' && steps.upload-run.outcome == 'success' }}
+        env:
+          CACHE_SCOPE: ${{ steps.metadata.outputs.cache_scope }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp run/all_numbers.csv "state/scopes/${CACHE_SCOPE}/all_numbers.csv"
+          cp run/scan_history.csv "state/scopes/${CACHE_SCOPE}/scan_history.csv"
+          cp run/catalog.csv state/catalog.csv
+          cp run/lifecycle.csv state/lifecycle.csv
+          cp run/mask_days.csv state/mask_days.csv
+          cp run/lifecycle_events.csv state/lifecycle_events.csv
+          python3 ci/state_cache.py write-manifest --state-dir state
+          python3 ci/state_cache.py validate --state-dir state
+
+      - name: Save collection state cache
+        id: save-state
+        if: ${{ always() && steps.stage-state.outcome == 'success' }}
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: state
+          key: raku-mobi-bangou-state-v3-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Stop after failed collection prerequisites
+        if: ${{ always() && ((steps.metadata.outputs.reuse == 'true' && (steps.download-reused-collection.outcome != 'success' || steps.reuse-collection.outcome != 'success' || steps.upload-run.outcome != 'success')) || (steps.metadata.outputs.reuse != 'true' && (steps.collect.outcome != 'success' || steps.catalog.outcome != 'success' || steps.package.outcome != 'success' || steps.upload-run.outcome != 'success' || steps.stage-state.outcome != 'success' || steps.save-state.outcome != 'success'))) }}
+        run: |
+          echo "Collection, reuse validation, artifact transfer, or cache persistence failed." >&2
+          exit 1
+
+  rank:
+    needs: collect
+    runs-on: [self-hosted, Linux, ARM64, codex]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+
+    outputs:
+      top-artifact: ${{ steps.rank-metadata.outputs.top-artifact }}
+
+    steps:
+      - name: Initialize ranking metadata
+        id: rank-metadata
+        shell: bash
+        run: echo "top-artifact=tops-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout ranking sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Verify ranking Python
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys; assert sys.version_info >= (3, 10)'
+
+      - name: Download collected run artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.collect.outputs.run-artifact }}
+          path: run
+
+      - name: Prepare sanitized Codex context
+        env:
+          SPECIALIZED: ${{ needs.collect.outputs.specialized }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          scope_args=()
+          if [[ "${SPECIALIZED}" == "true" ]]; then
+            test -s run/selected_masks.txt
+            mapfile -t selected_masks < run/selected_masks.txt
+            for mask in "${selected_masks[@]}"; do
+              scope_args+=(--specialized-mask "${mask}")
+            done
+          fi
+          python3 ci/top_tables.py prepare \
+            --current run/all_numbers.csv \
+            --masks-file masks.txt \
+            --diff run/diff.csv \
+            --diff-summary run/diff_summary.json \
+            "${scope_args[@]}" \
+            --output run/top-candidates.json
+
+      - name: Prepare compact Codex inputs
+        run: |
+          python3 ci/top_tables.py compact \
+            --context run/top-candidates.json \
+            --request-output run/ai/top-selection-request.json \
+            --direct-output run/ai/top-direct-candidates.jsonl \
+            --goroawase-output run/ai/top-goroawase-candidates.jsonl \
+            --newly-found-output run/ai/top-newly-found-candidates.jsonl
+
+      - name: Prepare temporary Codex runtime
+        id: codex-runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_home_candidate="${CODEX_HOME:-${HOME}/.codex}"
+          source_home="$(realpath -e -- "${source_home_candidate}")"
+          source_auth="$(realpath -e -- "${source_home}/auth.json")"
+          if [[ ! -f "${source_auth}" ]]; then
+            echo "Runner-local Codex auth.json is missing." >&2
+            exit 1
+          fi
+
+          runtime_root="$(mktemp -d "${RUNNER_TEMP}/raku-mobi-bangou-codex.XXXXXX")"
+          cleanup_failed_runtime() {
+            status="$?"
+            if (( status != 0 )) && [[ -d "${runtime_root}" ]]; then
+              find "${runtime_root}" -xdev -mindepth 1 -delete || true
+              rmdir -- "${runtime_root}" || true
+            fi
+            exit "${status}"
+          }
+          trap cleanup_failed_runtime EXIT
+          chmod 700 "${runtime_root}"
+          target_home="${runtime_root}/home"
+          target_work="${runtime_root}/work"
+          install -d -m 700 -- \
+            "${runtime_root}/npm" \
+            "${target_home}" \
+            "${target_work}" \
+            "${target_work}/tmp"
+          install -m 600 -- "${source_auth}" "${target_home}/auth.json"
+
+          umask 077
+          printf '%s\n' \
+            'cli_auth_credentials_store = "file"' \
+            'hide_agent_reasoning = true' \
+            'show_raw_agent_reasoning = false' \
+            '' \
+            '[history]' \
+            'persistence = "none"' \
+            '' \
+            '[features]' \
+            'shell_snapshot = false' \
+            'shell_tool = false' \
+            'unified_exec = false' \
+            '' \
+            '[shell_environment_policy]' \
+            'inherit = "none"' \
+            'ignore_default_excludes = false' \
+            > "${target_home}/config.toml"
+          install -m 600 -- ci/top-selection.schema.json \
+            "${target_work}/top-selection.schema.json"
+
+          {
+            echo "CODEX_SOURCE_AUTH=${source_auth}"
+            echo "CODEX_RUNTIME_ROOT=${runtime_root}"
+            echo "CODEX_TEMP_HOME=${target_home}"
+            echo "CODEX_TEMP_WORKDIR=${target_work}"
+            echo "CODEX_TEMP_OUTPUT=${target_work}/top-selection.json"
+            echo "CODEX_TEMP_SCHEMA=${target_work}/top-selection.schema.json"
+            echo "NPM_CONFIG_PREFIX=${runtime_root}/npm"
+            echo "NPM_CONFIG_CACHE=${runtime_root}/npm-cache"
+          } >> "${GITHUB_ENV}"
+          echo "home=${target_home}" >> "${GITHUB_OUTPUT}"
+          trap - EXIT
+
+      - name: Install pinned Codex with official Action
+        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e # v1.12
+        with:
+          codex-home: ${{ steps.codex-runtime.outputs.home }}
+          codex-version: "0.151.0"
+
+      - name: Prepare Codex ranking prompt
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            cat -- ci/codex-top-prompt.md
+            printf '%s\n' '<ranking-request-json>'
+            cat -- run/ai/top-selection-request.json
+            printf '%s\n' '</ranking-request-json>' '<top-candidates-jsonl>'
+            cat -- run/ai/top-direct-candidates.jsonl
+            printf '%s\n' '</top-candidates-jsonl>' '<goroawase-candidates-jsonl>'
+            cat -- run/ai/top-goroawase-candidates.jsonl
+            printf '%s\n' '</goroawase-candidates-jsonl>' '<newly-found-candidates-jsonl>'
+            cat -- run/ai/top-newly-found-candidates.jsonl
+            printf '%s\n' '</newly-found-candidates-jsonl>'
+          } > run/ai/codex-prompt.md
+
+      - name: Select and validate rankings with Codex
+        id: codex-ranking
+        shell: bash
+        run: |
+          set -euo pipefail
+          codex_bin="${CODEX_RUNTIME_ROOT}/npm/bin/codex"
+          if [[ ! -x "${codex_bin}" ]]; then
+            echo "The pinned Codex executable is unavailable." >&2
+            exit 1
+          fi
+          if ! env -i \
+            HOME="${CODEX_TEMP_HOME}" \
+            CODEX_HOME="${CODEX_TEMP_HOME}" \
+            PATH="${PATH}" \
+            "${codex_bin}" login status >/dev/null 2>&1; then
+            echo "The temporary Codex authentication check failed." >&2
+            exit 1
+          fi
+
+          rm -f -- run/ai/top-selection.json
+          for attempt in 1 2 3; do
+            echo "Codex ranking attempt ${attempt}/3"
+            rm -f -- "${CODEX_TEMP_OUTPUT}"
+            set +e
+            timeout --signal=TERM --kill-after=30s 15m \
+              env -i \
+                HOME="${CODEX_TEMP_HOME}" \
+                CODEX_HOME="${CODEX_TEMP_HOME}" \
+                TMPDIR="${CODEX_TEMP_WORKDIR}/tmp" \
+                PATH="${PATH}" \
+                NO_COLOR=1 \
+                "${codex_bin}" exec \
+                  --skip-git-repo-check \
+                  --cd "${CODEX_TEMP_WORKDIR}" \
+                  --output-last-message "${CODEX_TEMP_OUTPUT}" \
+                  --output-schema "${CODEX_TEMP_SCHEMA}" \
+                  --model gpt-5.6-sol \
+                  --config 'model_reasoning_effort="xhigh"' \
+                  --config 'service_tier="fast"' \
+                  --ephemeral \
+                  --strict-config \
+                  --color never \
+                  --sandbox read-only \
+                  < run/ai/codex-prompt.md \
+                  >/dev/null 2>&1
+            codex_status="$?"
+            set -e
+
+            if (( codex_status == 0 )) \
+              && python3 ci/top_tables.py validate-selection \
+                --context run/top-candidates.json \
+                --current run/all_numbers.csv \
+                --selection "${CODEX_TEMP_OUTPUT}" \
+                >/dev/null 2>&1; then
+              install -m 600 -- \
+                "${CODEX_TEMP_OUTPUT}" run/ai/top-selection.json
+              rm -f -- "${CODEX_TEMP_OUTPUT}"
+              echo "Codex ranking passed strict validation."
+              exit 0
+            fi
+            rm -f -- "${CODEX_TEMP_OUTPUT}"
+            echo "Codex ranking attempt ${attempt}/3 failed; details suppressed." >&2
+          done
+          echo "Codex ranking failed strict validation after 3 attempts." >&2
+          exit 1
+
+      - name: Render validated TOP tables
+        id: render-tops
+        env:
+          ROUNDS: ${{ needs.collect.outputs.rounds }}
+        run: |
+          python3 ci/top_tables.py render \
+            --context run/top-candidates.json \
+            --current run/all_numbers.csv \
+            --selection run/ai/top-selection.json \
+            --top-output run/TOP.md \
+            --goroawase-output run/GOROAWASE.md \
+            --release-output run/RELEASE_NOTES.md \
+            --rounds "${ROUNDS}" \
+            --diff-summary run/diff_summary.json \
+            --catalog-summary run/catalog_summary.json
+
+      - name: Persist refreshed Codex authentication
+        id: persist-codex-auth
+        if: ${{ always() && steps.codex-runtime.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          auth_directory="$(dirname -- "${CODEX_SOURCE_AUTH}")"
+          auth_tmp="$(mktemp "${auth_directory}/.auth.json.refresh.XXXXXX")"
+          trap 'rm -f -- "${auth_tmp}"' EXIT
+          install -m 600 -- "${CODEX_TEMP_HOME}/auth.json" "${auth_tmp}"
+          mv -fT -- "${auth_tmp}" "${CODEX_SOURCE_AUTH}"
+          trap - EXIT
+          echo "Codex authentication refresh was persisted."
+
+      - name: Upload TOP artifacts
+        if: ${{ always() && !cancelled() && steps.codex-ranking.outcome == 'success' && steps.render-tops.outcome == 'success' && steps.persist-codex-auth.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.rank-metadata.outputs.top-artifact }}
+          path: |
+            run/TOP.md
+            run/GOROAWASE.md
+            run/RELEASE_NOTES.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove local ranking traces
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${CODEX_RUNTIME_ROOT:-}" ]]; then
+            runtime_parent="$(dirname -- "${CODEX_RUNTIME_ROOT}")"
+            runtime_name="$(basename -- "${CODEX_RUNTIME_ROOT}")"
+            if [[ "$(realpath -e -- "${runtime_parent}")" != "$(realpath -e -- "${RUNNER_TEMP}")" ]] \
+              || [[ "${runtime_name}" != raku-mobi-bangou-codex.* ]]; then
+              echo "Refusing to remove an invalid Codex runtime path." >&2
+              exit 1
+            fi
+            if [[ -d "${CODEX_RUNTIME_ROOT}" ]]; then
+              find "${CODEX_RUNTIME_ROOT}" -xdev -mindepth 1 -delete
+              rmdir -- "${CODEX_RUNTIME_ROOT}"
+            fi
+          fi
+          generated_dir="${GITHUB_WORKSPACE}/run"
+          if [[ -d "${generated_dir}" ]]; then
+            find "${generated_dir}" -mindepth 1 -delete
+            rmdir -- "${generated_dir}"
+          fi
+
+  publish-release:
+    needs:
+      - collect
+      - rank
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download run artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.collect.outputs.run-artifact }}
+          path: release/run
+
+      - name: Download TOP artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.rank.outputs.top-artifact }}
+          path: release/run
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.collect.outputs.tag }}
+          SPECIALIZED: ${{ needs.collect.outputs.specialized }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          require_nonempty_file() {
+            local required_path="$1"
+            if [[ ! -f "${required_path}" || ! -s "${required_path}" ]]; then
+              echo "Required release file is missing or empty: ${required_path}" >&2
+              return 1
+            fi
+          }
+
+          assets=(
+            "release/run/TOP.md"
+            "release/run/GOROAWASE.md"
+            "release/run/all_numbers.csv"
+          )
+          for asset_path in "${assets[@]}"; do
+            require_nonempty_file "${asset_path}"
+          done
+          require_nonempty_file release/run/RELEASE_NOTES.md
+
+          if ! [[ "${TAG}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "Refusing to publish an invalid release tag: ${TAG@Q}" >&2
+            exit 1
+          fi
+          if ! [[ "${GITHUB_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Refusing to publish an invalid commit SHA: ${GITHUB_SHA@Q}" >&2
+            exit 1
+          fi
+          if ! [[ "${GITHUB_REPOSITORY}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Refusing to publish to an invalid repository: ${GITHUB_REPOSITORY@Q}" >&2
+            exit 1
+          fi
+          if [[ "${SPECIALIZED}" != "true" && "${SPECIALIZED}" != "false" ]]; then
+            echo "Invalid specialized-release flag: ${SPECIALIZED@Q}" >&2
+            exit 1
+          fi
+          GITHUB_SHA="${GITHUB_SHA,,}"
+
+          release_info="$(mktemp "${RUNNER_TEMP}/raku-mobi-bangou-release.XXXXXX")"
+          trap 'rm -f -- "${release_info}"' EXIT
+          if gh release view "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json tagName,targetCommitish \
+            > "${release_info}" 2>/dev/null; then
+            if ! jq -e \
+              --arg tag "${TAG}" \
+              --arg target "${GITHUB_SHA}" \
+              '.tagName == $tag and (.targetCommitish | ascii_downcase) == $target' \
+              "${release_info}" > /dev/null; then
+              echo "Existing release ${TAG} targets another commit." >&2
+              exit 1
+            fi
+          else
+            create_args=(
+              --repo "${GITHUB_REPOSITORY}"
+              --target "${GITHUB_SHA}"
+              --title "${TAG}"
+              --notes-file release/run/RELEASE_NOTES.md
+              --draft
+            )
+            if [[ "${SPECIALIZED}" == "true" ]]; then
+              create_args+=(--prerelease --latest=false)
+            fi
+            gh release create "${TAG}" "${create_args[@]}"
+          fi
+
+          gh release upload "${TAG}" "${assets[@]}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+
+          mapfile -t extra_assets < <(
+            gh release view "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json assets \
+              --jq '.assets[].name | select(. != "TOP.md" and . != "GOROAWASE.md" and . != "all_numbers.csv")'
+          )
+          for asset_name in "${extra_assets[@]}"; do
+            gh release delete-asset "${TAG}" "${asset_name}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --yes
+          done
+
+          edit_args=(
+            --repo "${GITHUB_REPOSITORY}"
+            --target "${GITHUB_SHA}"
+            --title "${TAG}"
+            --notes-file release/run/RELEASE_NOTES.md
+            --draft=false
+          )
+          if [[ "${SPECIALIZED}" == "true" ]]; then
+            edit_args+=(--prerelease --latest=false)
+          else
+            edit_args+=(--prerelease=false)
+          fi
+          gh release edit "${TAG}" "${edit_args[@]}"

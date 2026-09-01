@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "top",
+    "goroawase",
+    "newlyFound"
+  ],
+  "properties": {
+    "top": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "$ref": "#/$defs/topEntry"
+      }
+    },
+    "goroawase": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "$ref": "#/$defs/goroawaseEntry"
+      }
+    },
+    "newlyFound": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "$ref": "#/$defs/newlyFoundEntry"
+      }
+    }
+  },
+  "$defs": {
+    "topEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidateId"
+      ],
+      "properties": {
+        "candidateId": {
+          "type": "string",
+          "pattern": "^T[0-9]{3}$"
+        }
+      }
+    },
+    "goroawaseEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidateId"
+      ],
+      "properties": {
+        "candidateId": {
+          "type": "string",
+          "pattern": "^G[0-9]{3}$"
+        }
+      }
+    },
+    "newlyFoundEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidateId"
+      ],
+      "properties": {
+        "candidateId": {
+          "type": "string",
+          "pattern": "^N[0-9]{3}$"
+        }
+      }
+    }
+  }
+}

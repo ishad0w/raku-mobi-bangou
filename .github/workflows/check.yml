@@ -1,0 +1,52 @@
+name: CI-check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.10"
+
+      - name: Run unit tests
+        run: python3 -W error -m unittest discover -s tests -v
+
+      - name: Install pinned workflow linters
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_dir="${RUNNER_TEMP}/workflow-linters"
+          mkdir -p "${tool_dir}"
+
+          curl --fail --silent --show-error --location \
+            --output "${tool_dir}/actionlint.tar.gz" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  ${tool_dir}/actionlint.tar.gz" \
+            | sha256sum --check --strict
+          tar -xzf "${tool_dir}/actionlint.tar.gz" -C "${tool_dir}" actionlint
+
+          curl --fail --silent --show-error --location \
+            --output "${tool_dir}/shellcheck.tar.xz" \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  ${tool_dir}/shellcheck.tar.xz" \
+            | sha256sum --check --strict
+          tar -xJf "${tool_dir}/shellcheck.tar.xz" -C "${tool_dir}"
+
+          echo "${tool_dir}" >> "${GITHUB_PATH}"
+          echo "${tool_dir}/shellcheck-v0.11.0" >> "${GITHUB_PATH}"
+
+      - name: Lint workflows and embedded shell
+        run: actionlint
