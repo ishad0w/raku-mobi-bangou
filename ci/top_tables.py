@@ -14,7 +14,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 
 RAW_PHONE_RE = re.compile(r"0[0-9]{10}")
@@ -25,7 +25,7 @@ KANA_PREFIX_RE = re.compile(r"[ぁ-んァ-ヶ]")
 TIMESTAMP_RE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
 )
-CANDIDATE_ID_RE = re.compile(r"[TGN][0-9]{3}")
+CANDIDATE_ID_RE = re.compile(r"[TVGN][0-9]{3}")
 
 DIGIT_JA = {
     "0": "ぜろ",
@@ -51,13 +51,37 @@ MORA_COUNT = {
     "8": 2,
     "9": 2,
 }
-BASE_DIRECT_CANDIDATES = 100
-MAX_DIRECT_CANDIDATES = 200
-MAX_STRONG_PATTERN_CANDIDATES = 100
-MAX_BALANCED_ECHO_CANDIDATES = 100
-MAX_GOROAWASE_CANDIDATES = 100
+DIGIT_FINAL_MORA = {
+    "0": "ろ",
+    "1": "ち",
+    "2": "に",
+    "3": "ん",
+    "4": "ん",
+    "5": "ご",
+    "6": "く",
+    "7": "な",
+    "8": "ち",
+    "9": "う",
+}
+DIGIT_RHYME_CLASS = {
+    "0": "o",
+    "1": "i",
+    "2": "i",
+    "3": "N",
+    "4": "N",
+    "5": "o",
+    "6": "u",
+    "7": "a",
+    "8": "i",
+    "9": "u",
+}
+MAX_SOUND_CANDIDATES = 200
+MAX_VISUAL_CANDIDATES = 200
+MAX_GOROAWASE_CANDIDATES = 120
 MAX_NEWLY_FOUND_CANDIDATES = 100
-DIVERSE_CANDIDATES_PER_MASK = 1
+SHORTLIST_FAMILY_CAP = 6
+FINAL_FAMILY_CAP = 3
+NEWLY_FOUND_FAMILY_CAP = 2
 RANKING_LIMIT = 30
 NEWLY_FOUND_RANKING_LIMIT = 10
 CURRENT_FIELDS = ("phoneNumber", "id", "sourceMask")
@@ -69,8 +93,8 @@ DIFF_FIELDS = (
     "sourceMask",
 )
 CURRENT_SOURCE_KIND = "currentSnapshot"
-CONTEXT_SCHEMA_VERSION = 4
-QUALITY_ORDER_BAND_SIZE = RANKING_LIMIT
+CONTEXT_SCHEMA_VERSION = 5
+FEATURE_MODEL_VERSION = 2
 
 
 class DataError(ValueError):
@@ -247,61 +271,32 @@ def mora_pattern(block: str) -> tuple[int, ...]:
     return tuple(MORA_COUNT[digit] for digit in block)
 
 
-def block_features(label: str, block: str) -> tuple[int, list[str]]:
-    signals: list[str] = []
-    score = 0
-    pattern = mora_pattern(block)
-    if len(set(block)) == 1:
-        return -10, [f"{label}: four identical digits may be miscounted"]
-    if block[:2] == block[2:]:
-        signals.append(f"{label}: ABAB")
-        score += 5
-    if block == block[::-1]:
-        signals.append(f"{label}: palindrome")
-        score += 5
-    if block[0] == block[1] and block[2] == block[3]:
-        signals.append(f"{label}: AABB")
-        score += 3
-    if len(set(block)) <= 2:
-        signals.append(f"{label}: at most two distinct digits")
-        score += 1
-    if (
-        pattern[0] == pattern[2]
-        and pattern[1] == pattern[3]
-        and pattern[0] != pattern[1]
-    ):
-        signals.append(
-            f"{label}: alternating mora cadence {'-'.join(map(str, pattern))}"
-        )
-        score += 8
-    if (
-        pattern[0] == pattern[3]
-        and pattern[1] == pattern[2]
-        and pattern[0] != pattern[1]
-    ):
-        signals.append(
-            f"{label}: mirrored mora cadence {'-'.join(map(str, pattern))}"
-        )
-        score += 5
-    return score, signals
+def pair_chunks(first: str, second: str) -> tuple[str, ...]:
+    return (first[:2], first[2:], second[:2], second[2:])
 
 
-def is_strong_pattern(block: str) -> bool:
-    return (
-        block[:2] == block[2:]
-        or block == block[::-1]
-        or (block[0] == block[1] and block[2] == block[3])
-    )
+def pair_mora_pattern(first: str, second: str) -> tuple[int, ...]:
+    return tuple(sum(MORA_COUNT[digit] for digit in pair) for pair in pair_chunks(first, second))
 
 
-def is_balanced_echo(record: dict[str, str]) -> bool:
-    phone = raw_phone(record["phoneNumber"])
-    first = phone[3:7]
-    second = phone[7:]
-    first_mora = sum(MORA_COUNT[digit] for digit in first)
-    second_mora = sum(MORA_COUNT[digit] for digit in second)
-    aligned = sum(left == right for left, right in zip(first, second))
-    return first_mora == second_mora and aligned >= 2
+def pair_ending_pattern(first: str, second: str) -> tuple[str, ...]:
+    return tuple(DIGIT_FINAL_MORA[pair[-1]] for pair in pair_chunks(first, second))
+
+
+def pair_rhyme_pattern(first: str, second: str) -> tuple[str, ...]:
+    return tuple(DIGIT_RHYME_CLASS[pair[-1]] for pair in pair_chunks(first, second))
+
+
+def maximum_digit_run(block: str) -> int:
+    longest = 1
+    current = 1
+    for previous, digit in zip(block, block[1:]):
+        if digit == previous:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 1
+    return longest
 
 
 def stable_hash_key(*parts: str) -> bytes:
@@ -309,92 +304,325 @@ def stable_hash_key(*parts: str) -> bytes:
     return hashlib.sha256("\0".join(parts).encode("utf-8")).digest()
 
 
-def balanced_stable_interleave(
-    ranked_records: Sequence[dict[str, str]],
-    *,
-    band_size: int = QUALITY_ORDER_BAND_SIZE,
-) -> list[dict[str, str]]:
-    """Balance masks inside fixed quality bands without changing membership."""
-    if band_size < 1:
-        raise DataError("quality-order band size must be positive")
-
-    ordered: list[dict[str, str]] = []
-    for band_number, start in enumerate(range(0, len(ranked_records), band_size)):
-        band = ranked_records[start : start + band_size]
-        by_mask: dict[str, list[dict[str, str]]] = {}
-        for record in band:
-            by_mask.setdefault(record["sourceMask"], []).append(record)
-        mask_order = sorted(
-            by_mask,
-            key=lambda mask: (stable_hash_key(str(band_number), mask), mask),
-        )
-        position = 0
-        while True:
-            added = False
-            for mask in mask_order:
-                records = by_mask[mask]
-                if position < len(records):
-                    ordered.append(records[position])
-                    added = True
-            if not added:
-                break
-            position += 1
-    return ordered
-
-
-def direct_features(record: dict[str, str]) -> tuple[int, list[str]]:
+def sound_features(record: dict[str, str]) -> tuple[int, list[str]]:
     phone = raw_phone(record["phoneNumber"])
     first = phone[3:7]
     second = phone[7:]
-    prefix = common_prefix_length(first, second)
-    suffix = common_suffix_length(first, second)
-    aligned = sum(left == right for left, right in zip(first, second))
-    first_block_score, first_signals = block_features("first block", first)
-    second_block_score, second_signals = block_features("second block", second)
-    signals = first_signals + second_signals
-
-    if prefix:
-        signals.append(f"shared prefix: {prefix} digit(s)")
-    if suffix:
-        signals.append(f"shared suffix: {suffix} digit(s)")
-    if aligned:
-        signals.append(f"same aligned digits: {aligned}/4")
-
+    signals: list[str] = []
+    score = 0
     first_pattern = mora_pattern(first)
     second_pattern = mora_pattern(second)
     first_mora = sum(first_pattern)
     second_mora = sum(second_pattern)
+    pair_moras = pair_mora_pattern(first, second)
+    pair_endings = pair_ending_pattern(first, second)
+    pair_rhymes = pair_rhyme_pattern(first, second)
+
+    if len(set(pair_moras)) == 1:
+        signals.append(
+            "four even two-digit phrases: " + "-".join(map(str, pair_moras))
+        )
+        score += 18 if pair_moras[0] == 3 else 6
+    elif pair_moras[:2] == pair_moras[2:]:
+        signals.append(
+            "parallel two-digit cadence: " + "-".join(map(str, pair_moras))
+        )
+        score += 8
+    elif pair_moras[0] == pair_moras[2] or pair_moras[1] == pair_moras[3]:
+        signals.append(
+            "partial two-digit cadence echo: " + "-".join(map(str, pair_moras))
+        )
+        score += 3
+    if max(pair_moras) - min(pair_moras) <= 1:
+        score += 2
+
+    if len(set(pair_endings)) == 1:
+        signals.append(f"four two-digit phrases end in {pair_endings[0]}")
+        score += 10
+    elif pair_endings[:2] == pair_endings[2:]:
+        signals.append("parallel two-digit phrase endings")
+        score += 6
+    else:
+        matching_positions = sum(
+            left == right for left, right in zip(pair_endings[:2], pair_endings[2:])
+        )
+        if matching_positions:
+            signals.append(
+                f"matching two-digit phrase endings: {matching_positions}/2"
+            )
+            score += matching_positions * 2
+
+    if len(set(pair_rhymes)) == 1 and len(set(pair_endings)) > 1:
+        signals.append("four two-digit phrases share a vowel rhyme")
+        score += 4
+    elif pair_rhymes[:2] == pair_rhymes[2:] and pair_endings[:2] != pair_endings[2:]:
+        signals.append("parallel two-digit vowel rhyme")
+        score += 3
+
     if first_mora == second_mora:
         signals.append(f"equal mora count: {first_mora}+{second_mora}")
+        score += 5
     if first_pattern == second_pattern:
         signals.append(
             "parallel mora patterns: " + "-".join(map(str, first_pattern))
         )
-    if first == second:
-        signals.append("exact four-digit block repetition")
-    elif aligned >= 3:
-        signals.append("near-identical blocks may be misheard")
+        score += 8
 
-    score = first_block_score + second_block_score
-    score += prefix * 2 + suffix * 3 + aligned * 2
-    score += 3 if first_mora == second_mora else 0
-    score += 7 if first_pattern == second_pattern else 0
-    score += 10 if first == second else 0
-    score -= 6 if first != second and aligned >= 3 else 0
+    chunks = pair_chunks(first, second)
+    repeated_chunks = sorted({chunk for chunk in chunks if chunks.count(chunk) > 1})
+    if repeated_chunks:
+        signals.append(
+            "repeated spoken two-digit phrase(s): " + ", ".join(repeated_chunks)
+        )
+        repeated_instances = sum(chunks.count(chunk) - 1 for chunk in repeated_chunks)
+        score += min(10, repeated_instances * 4)
+
+    if first == second:
+        signals.append("exact spoken four-digit block repetition")
+        score += 8
+    else:
+        hamming_distance = sum(left != right for left, right in zip(first, second))
+        if hamming_distance == 1:
+            signals.append("near-identical spoken blocks may be misheard")
+            score -= 5
+
+    for label, block in (("first block", first), ("second block", second)):
+        run = maximum_digit_run(block)
+        if run == 4:
+            signals.append(f"{label}: four identical digits may be miscounted")
+            score -= 14
+        elif run == 3:
+            signals.append(f"{label}: three identical digits may be miscounted")
+            score -= 5
     return score, signals
 
 
-def direct_candidate(record: dict[str, str]) -> dict[str, object]:
-    _score, signals = direct_features(record)
+def arithmetic_step(block: str) -> int | None:
+    steps = [int(right) - int(left) for left, right in zip(block, block[1:])]
+    return steps[0] if len(set(steps)) == 1 and steps[0] in {-2, -1, 1, 2} else None
+
+
+def visual_block_features(label: str, block: str) -> tuple[int, list[str]]:
+    score = 0
+    signals: list[str] = []
+    if len(set(block)) == 1:
+        signals.append(f"{label}: AAAA")
+        return 20, signals
+    if block[:2] == block[2:]:
+        signals.append(f"{label}: ABAB")
+        score += 14
+    if block == block[::-1]:
+        signals.append(f"{label}: palindrome")
+        score += 12
+    if block[0] == block[1] and block[2] == block[3]:
+        signals.append(f"{label}: AABB")
+        score += 8
+    step = arithmetic_step(block)
+    if step is not None:
+        label_step = "consecutive sequence" if abs(step) == 1 else "same-parity sequence"
+        signals.append(f"{label}: {label_step} ({step:+d})")
+        score += 10 if abs(step) == 1 else 12
+    if len(set(block)) == 2:
+        signals.append(f"{label}: two distinct digits")
+        score += 3
+    return score, signals
+
+
+def visual_features(record: dict[str, str]) -> tuple[int, list[str]]:
     phone = raw_phone(record["phoneNumber"])
+    first = phone[3:7]
+    second = phone[7:]
+    tail = first + second
+    first_score, first_signals = visual_block_features("first block", first)
+    second_score, second_signals = visual_block_features("second block", second)
+    score = first_score + second_score
+    signals = first_signals + second_signals
+
+    hamming_distance = sum(left != right for left, right in zip(first, second))
+    if first == second:
+        signals.append("exact four-digit block repetition")
+        score += 25
+    elif hamming_distance == 1:
+        signals.append("four-digit blocks differ in one position")
+        score += 14
+    elif hamming_distance == 2:
+        signals.append("four-digit blocks differ in two positions")
+        score += 7
+
+    if tail == tail[::-1]:
+        signals.append("full eight-digit palindrome")
+        score += 20
+    if first == second[::-1] and first != second:
+        signals.append("four-digit blocks mirror each other")
+        score += 18
+    if first == first[::-1] and second == second[::-1]:
+        signals.append("both four-digit blocks are palindromes")
+        score += 10
+
+    prefix = common_prefix_length(first, second)
+    suffix = common_suffix_length(first, second)
+    if prefix:
+        signals.append(f"shared block prefix: {prefix} digit(s)")
+        score += prefix * 2
+    if suffix:
+        signals.append(f"shared block suffix: {suffix} digit(s)")
+        score += suffix * 2
+
+    chunks = pair_chunks(first, second)
+    repeated_chunks = sorted({chunk for chunk in chunks if chunks.count(chunk) > 1})
+    if repeated_chunks:
+        signals.append("repeated two-digit chunk(s): " + ", ".join(repeated_chunks))
+        score += min(12, sum(chunks.count(chunk) - 1 for chunk in repeated_chunks) * 4)
+    if chunks[1] == chunks[2]:
+        signals.append("two-digit chunk repeats across the block boundary")
+        score += 12
+    if chunks[:2] == chunks[2:]:
+        signals.append("two-digit chunk pattern repeats across both blocks")
+        score += 14
+    elif chunks[0] == chunks[3] and chunks[1] == chunks[2]:
+        signals.append("two-digit chunks form a four-part palindrome")
+        score += 12
+
+    distinct_digits = len(set(tail))
+    if distinct_digits == 2:
+        signals.append("two distinct digits across the eight-digit tail")
+        score += 8
+    elif distinct_digits == 3:
+        signals.append("three distinct digits across the eight-digit tail")
+        score += 4
+    return score, signals
+
+
+def sound_family(record: dict[str, str]) -> str:
+    return raw_phone(record["phoneNumber"])[7:]
+
+
+def ranked_records(
+    records: Sequence[dict[str, str]],
+    feature_function: Callable[[dict[str, str]], tuple[int, list[str]]],
+) -> list[dict[str, str]]:
+    return sorted(
+        records,
+        key=lambda record: (
+            -feature_function(record)[0],
+            stable_hash_key(record["phoneNumber"]),
+            record["phoneNumber"],
+        ),
+    )
+
+
+def shortlist_with_family_cap(
+    ranked: Sequence[dict[str, str]],
+    *,
+    maximum: int,
+    family: Callable[[dict[str, str]], str],
+    reservation: Callable[[dict[str, str]], str] | None = None,
+) -> list[dict[str, str]]:
+    """Keep the best choices while preventing one prolific family taking over."""
+    target = min(maximum, len(ranked))
+    selected: list[dict[str, str]] = []
+    selected_phones: set[str] = set()
+    family_counts: dict[str, int] = {}
+    if reservation is not None:
+        best_by_reservation: dict[str, dict[str, str]] = {}
+        for record in ranked:
+            best_by_reservation.setdefault(reservation(record), record)
+        for record in list(best_by_reservation.values())[:target]:
+            selected.append(record)
+            selected_phones.add(record["phoneNumber"])
+            family_key = family(record)
+            family_counts[family_key] = family_counts.get(family_key, 0) + 1
+
+    for record in ranked:
+        if len(selected) >= target:
+            break
+        if record["phoneNumber"] in selected_phones:
+            continue
+        family_key = family(record)
+        if family_counts.get(family_key, 0) >= SHORTLIST_FAMILY_CAP:
+            continue
+        selected.append(record)
+        selected_phones.add(record["phoneNumber"])
+        family_counts[family_key] = family_counts.get(family_key, 0) + 1
+        if len(selected) == target:
+            break
+
+    if len(selected) < target:
+        for record in ranked:
+            if record["phoneNumber"] in selected_phones:
+                continue
+            selected.append(record)
+            selected_phones.add(record["phoneNumber"])
+            if len(selected) == target:
+                break
+
+    position = {record["phoneNumber"]: index for index, record in enumerate(ranked)}
+    return sorted(selected, key=lambda record: position[record["phoneNumber"]])
+
+
+def sound_candidate(record: dict[str, str]) -> dict[str, object]:
+    score, signals = sound_features(record)
+    phone = raw_phone(record["phoneNumber"])
+    first = phone[3:7]
+    second = phone[7:]
     return {
         "phoneNumber": record["phoneNumber"],
         "standardReading": record["standardReading"],
         "flowReading": flow_reading(phone),
-        "firstMoraPattern": list(mora_pattern(phone[3:7])),
-        "secondMoraPattern": list(mora_pattern(phone[7:])),
+        "firstMoraPattern": list(mora_pattern(first)),
+        "secondMoraPattern": list(mora_pattern(second)),
+        "pairMoraPattern": list(pair_mora_pattern(first, second)),
+        "pairEndingPattern": list(pair_ending_pattern(first, second)),
+        "pairRhymePattern": list(pair_rhyme_pattern(first, second)),
+        "soundScore": score,
         "soundSignals": signals,
+        "familyKey": sound_family(record),
     }
+
+
+def visual_candidate(record: dict[str, str]) -> dict[str, object]:
+    score, signals = visual_features(record)
+    return {
+        "phoneNumber": record["phoneNumber"],
+        "standardReading": record["standardReading"],
+        "visualScore": score,
+        "visualSignals": signals,
+        "familyKey": sound_family(record),
+    }
+
+
+def goroawase_features(
+    record: dict[str, str],
+    first_hint: str,
+    second_hint: str,
+) -> tuple[int, list[str], str, str]:
+    phone = raw_phone(record["phoneNumber"])
+    first = phone[3:7]
+    second = phone[7:]
+    if first_hint and second_hint:
+        scope = "bothBlocks"
+        family = f"first:{first}"
+        score = 30
+        signals = ["reviewed wordplay hints for both blocks"]
+    elif first_hint:
+        scope = "firstBlock"
+        family = f"first:{first}"
+        score = 21
+        signals = ["reviewed wordplay hint for the first block"]
+    elif second_hint:
+        scope = "secondBlock"
+        family = f"second:{second}"
+        score = 18
+        signals = ["reviewed wordplay hint for the second block"]
+    else:
+        raise DataError(f"{record['phoneNumber']}: goroawase candidate has no hint")
+
+    sound_score = sound_features(record)[0]
+    score += max(-4, min(10, sound_score // 6))
+    if first_hint and first_hint == second_hint:
+        signals.append("the same reviewed wordplay repeats across both blocks")
+        score += 5
+    return score, signals, scope, family
 
 
 def goroawase_candidate(
@@ -404,10 +632,12 @@ def goroawase_candidate(
     phone = raw_phone(record["phoneNumber"])
     first = phone[3:7]
     second = phone[7:]
-    _score, signals = direct_features(record)
     standard_groups = record["standardReading"].split("｜")
     first_hint = mask_readings.get(first, "")
     second_hint = mask_readings.get(second, "")
+    score, signals, hint_scope, family = goroawase_features(
+        record, first_hint, second_hint
+    )
     suggested_reading = "｜".join(
         (
             standard_groups[0],
@@ -433,139 +663,76 @@ def goroawase_candidate(
         "firstBlockHint": first_hint,
         "secondBlock": second,
         "secondBlockHint": second_hint,
-        "soundSignals": signals,
+        "hintScope": hint_scope,
+        "goroawaseScore": score,
+        "goroawaseSignals": signals,
+        "familyKey": family,
     }
 
 
 def build_shortlists(
     records: list[dict[str, str]],
     mask_readings: dict[str, str],
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    ranked = sorted(
-        records,
-        key=lambda record: (
-            -direct_features(record)[0],
-            stable_hash_key(record["phoneNumber"]),
-            record["phoneNumber"],
-        ),
+) -> tuple[
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
+    sound_records = shortlist_with_family_cap(
+        ranked_records(records, sound_features),
+        maximum=MAX_SOUND_CANDIDATES,
+        family=sound_family,
+    )
+    visual_records = shortlist_with_family_cap(
+        ranked_records(records, visual_features),
+        maximum=MAX_VISUAL_CANDIDATES,
+        family=sound_family,
     )
 
-    direct_records: dict[str, dict[str, str]] = {}
-
-    def add_direct_candidates(
-        candidates: Iterable[dict[str, str]],
-        addition_limit: int | None = None,
-    ) -> None:
-        added = 0
-        for candidate in candidates:
-            if len(direct_records) >= MAX_DIRECT_CANDIDATES:
-                break
-            phone_number = candidate["phoneNumber"]
-            if phone_number in direct_records:
-                continue
-            direct_records[phone_number] = candidate
-            added += 1
-            if addition_limit is not None and added >= addition_limit:
-                break
-
-    # Reserve representation before global scoring can fill the shortlist.
-    # This makes a productive new source mask visible to the language curator.
-    records_by_mask: dict[str, list[dict[str, str]]] = {}
-    for record in ranked:
-        records_by_mask.setdefault(record["sourceMask"], []).append(record)
-    ordered_masks = list(mask_readings)
-    ordered_masks.extend(sorted(set(records_by_mask) - set(ordered_masks)))
-    for position in range(DIVERSE_CANDIDATES_PER_MASK):
-        add_direct_candidates(
-            records_by_mask[mask][position]
-            for mask in ordered_masks
-            if position < len(records_by_mask.get(mask, []))
-        )
-
-    add_direct_candidates(ranked[:BASE_DIRECT_CANDIDATES])
-    add_direct_candidates(
-        (
-            record
-            for record in ranked
-            if any(
-                is_strong_pattern(block)
-                for block in (
-                    raw_phone(record["phoneNumber"])[3:7],
-                    raw_phone(record["phoneNumber"])[7:],
-                )
-            )
-        ),
-        MAX_STRONG_PATTERN_CANDIDATES,
-    )
-    add_direct_candidates(
-        (record for record in ranked if is_balanced_echo(record)),
-        MAX_BALANCED_ECHO_CANDIDATES,
-    )
-
-    add_direct_candidates(ranked)
-
-    direct_ranked = sorted(
-        direct_records.values(),
-        key=lambda record: (
-            -direct_features(record)[0],
-            stable_hash_key(record["phoneNumber"]),
-            record["phoneNumber"],
-        ),
-    )
-    direct = [
-        direct_candidate(record)
-        for record in balanced_stable_interleave(direct_ranked)
-    ]
-
-    selected: dict[str, dict[str, str]] = {}
-    per_mask: dict[str, int] = {}
-    for record in sorted(
-        records,
-        key=lambda item: (
-            not bool(
-                mask_readings.get(raw_phone(item["phoneNumber"])[3:7], "")
-            ),
-            -direct_features(item)[0],
-            stable_hash_key(item["phoneNumber"]),
-            item["phoneNumber"],
-        ),
-    ):
-        phone = raw_phone(record["phoneNumber"])
-        first = phone[3:7]
-        second = phone[7:]
-        has_first_hint = bool(mask_readings.get(first, ""))
-        has_second_hint = bool(mask_readings.get(second, ""))
-        if not has_first_hint and not has_second_hint:
-            continue
-        if has_first_hint or per_mask.get(second, 0) < 2:
-            selected[record["phoneNumber"]] = record
-            per_mask[second] = per_mask.get(second, 0) + 1
-        if len(selected) >= MAX_GOROAWASE_CANDIDATES:
-            break
-
-    for record in ranked:
-        if len(selected) >= min(MAX_GOROAWASE_CANDIDATES, len(records)):
-            break
+    hinted_records = []
+    for record in records:
         phone = raw_phone(record["phoneNumber"])
         if mask_readings.get(phone[3:7], "") or mask_readings.get(phone[7:], ""):
-            selected.setdefault(record["phoneNumber"], record)
+            hinted_records.append(record)
 
-    goro_records = sorted(
-        selected.values(),
-        key=lambda record: (
-            not bool(
-                mask_readings.get(raw_phone(record["phoneNumber"])[3:7], "")
-            ),
-            -direct_features(record)[0],
-            stable_hash_key(record["phoneNumber"]),
-            record["phoneNumber"],
-        ),
-    )[:MAX_GOROAWASE_CANDIDATES]
-    goroawase = [
-        goroawase_candidate(record, mask_readings)
-        for record in balanced_stable_interleave(goro_records)
-    ]
-    return direct, goroawase
+    def goro_sort_features(record: dict[str, str]) -> tuple[int, list[str]]:
+        phone = raw_phone(record["phoneNumber"])
+        score, signals, _scope, _family = goroawase_features(
+            record,
+            mask_readings.get(phone[3:7], ""),
+            mask_readings.get(phone[7:], ""),
+        )
+        return score, signals
+
+    def goro_family(record: dict[str, str]) -> str:
+        phone = raw_phone(record["phoneNumber"])
+        _score, _signals, _scope, family = goroawase_features(
+            record,
+            mask_readings.get(phone[3:7], ""),
+            mask_readings.get(phone[7:], ""),
+        )
+        return family
+
+    def goro_reservation(record: dict[str, str]) -> str:
+        phone = raw_phone(record["phoneNumber"])
+        _score, _signals, scope, family = goroawase_features(
+            record,
+            mask_readings.get(phone[3:7], ""),
+            mask_readings.get(phone[7:], ""),
+        )
+        return f"{scope}:{family}"
+
+    goro_records = shortlist_with_family_cap(
+        ranked_records(hinted_records, goro_sort_features),
+        maximum=MAX_GOROAWASE_CANDIDATES,
+        family=goro_family,
+        reservation=goro_reservation,
+    )
+    return (
+        [sound_candidate(record) for record in sound_records],
+        [visual_candidate(record) for record in visual_records],
+        [goroawase_candidate(record, mask_readings) for record in goro_records],
+    )
 
 
 def build_newly_found_shortlist(
@@ -574,21 +741,12 @@ def build_newly_found_shortlist(
     """Build a direct-sound shortlist from phones added since the baseline."""
     if len(records) < NEWLY_FOUND_RANKING_LIMIT:
         return []
-    ranked = sorted(
-        records,
-        key=lambda record: (
-            -direct_features(record)[0],
-            stable_hash_key(record["phoneNumber"]),
-            record["phoneNumber"],
-        ),
-    )[:MAX_NEWLY_FOUND_CANDIDATES]
-    return [
-        direct_candidate(record)
-        for record in balanced_stable_interleave(
-            ranked,
-            band_size=NEWLY_FOUND_RANKING_LIMIT,
-        )
-    ]
+    ranked = shortlist_with_family_cap(
+        ranked_records(records, sound_features),
+        maximum=MAX_NEWLY_FOUND_CANDIDATES,
+        family=sound_family,
+    )
+    return [sound_candidate(record) for record in ranked]
 
 
 def load_diff_summary(path: Path) -> dict[str, object]:
@@ -783,14 +941,16 @@ def validate_compact_paths(
     *,
     context_path: Path,
     request_output: Path,
-    direct_output: Path,
+    sound_output: Path,
+    visual_output: Path,
     goroawase_output: Path,
     newly_found_output: Path,
 ) -> None:
     paths = {
         "candidate context": resolved_path(context_path, "candidate context"),
         "AI request output": resolved_path(request_output, "AI request output"),
-        "direct AI output": resolved_path(direct_output, "direct AI output"),
+        "sound AI output": resolved_path(sound_output, "sound AI output"),
+        "visual AI output": resolved_path(visual_output, "visual AI output"),
         "goroawase AI output": resolved_path(
             goroawase_output, "goroawase AI output"
         ),
@@ -802,7 +962,8 @@ def validate_compact_paths(
         raise DataError("compact input and output paths must all be distinct")
     output_parents = {
         paths["AI request output"].parent,
-        paths["direct AI output"].parent,
+        paths["sound AI output"].parent,
+        paths["visual AI output"].parent,
         paths["goroawase AI output"].parent,
         paths["newly-found AI output"].parent,
     }
@@ -896,7 +1057,7 @@ def prepare_context(
         allowed_source_masks=set(normalized_scope) if specialized else None,
         minimum_records=0 if specialized else RANKING_LIMIT,
     )
-    direct, goroawase = build_shortlists(records, mask_readings)
+    sound, visual, goroawase = build_shortlists(records, mask_readings)
     scanned_masks = set(normalized_scope) if specialized else set(mask_readings)
     newly_found_records = load_newly_found_records(
         records,
@@ -905,10 +1066,15 @@ def prepare_context(
         scanned_masks=scanned_masks,
     )
     newly_found = build_newly_found_shortlist(newly_found_records)
-    if not specialized and len(direct) < RANKING_LIMIT:
+    if not specialized and len(sound) < RANKING_LIMIT:
         raise DataError(
-            f"fewer than {RANKING_LIMIT} direct candidates are available; "
-            f"found {len(direct)}"
+            f"fewer than {RANKING_LIMIT} sound candidates are available; "
+            f"found {len(sound)}"
+        )
+    if not specialized and len(visual) < RANKING_LIMIT:
+        raise DataError(
+            f"fewer than {RANKING_LIMIT} visual candidates are available; "
+            f"found {len(visual)}"
         )
     if not specialized and len(goroawase) < RANKING_LIMIT:
         raise DataError(
@@ -916,7 +1082,8 @@ def prepare_context(
             f"found {len(goroawase)}"
         )
     selection_counts = {
-        "top": min(RANKING_LIMIT, len(direct)),
+        "top": min(RANKING_LIMIT, len(sound)),
+        "visual": min(RANKING_LIMIT, len(visual)),
         "goroawase": min(RANKING_LIMIT, len(goroawase)),
         "newlyFound": (
             NEWLY_FOUND_RANKING_LIMIT
@@ -926,6 +1093,7 @@ def prepare_context(
     }
     payload = {
         "schemaVersion": CONTEXT_SCHEMA_VERSION,
+        "featureModelVersion": FEATURE_MODEL_VERSION,
         "sourceSnapshot": {
             "kind": CURRENT_SOURCE_KIND,
             "sha256": snapshot_digest,
@@ -937,7 +1105,8 @@ def prepare_context(
             "masks": normalized_scope,
         },
         "goroawaseCandidates": goroawase,
-        "directCandidates": direct,
+        "soundCandidates": sound,
+        "visualCandidates": visual,
         "newlyFoundCandidates": newly_found,
     }
     write_text_atomic(
@@ -955,7 +1124,7 @@ def compact_json_lines(records: Iterable[dict[str, object]]) -> str:
 
 def candidate_id(prefix: str, position: int) -> str:
     """Return the stable, compact identifier for one ordered candidate."""
-    if prefix not in {"T", "G", "N"} or not 1 <= position <= 999:
+    if prefix not in {"T", "V", "G", "N"} or not 1 <= position <= 999:
         raise DataError("cannot assign candidate ID")
     return f"{prefix}{position:03d}"
 
@@ -964,7 +1133,8 @@ def write_compact_ai_inputs(
     *,
     context_path: Path,
     request_output: Path,
-    direct_output: Path,
+    sound_output: Path,
+    visual_output: Path,
     goroawase_output: Path,
     newly_found_output: Path,
 ) -> None:
@@ -972,12 +1142,14 @@ def write_compact_ai_inputs(
     validate_compact_paths(
         context_path=context_path,
         request_output=request_output,
-        direct_output=direct_output,
+        sound_output=sound_output,
+        visual_output=visual_output,
         goroawase_output=goroawase_output,
         newly_found_output=newly_found_output,
     )
     (
-        direct,
+        sound,
+        visual,
         goroawase,
         newly_found,
         selection_counts,
@@ -985,16 +1157,31 @@ def write_compact_ai_inputs(
         source_snapshot,
     ) = load_context(context_path)
 
-    direct_records = [
+    sound_records = [
         {
             "candidateId": candidate_id("T", position),
             "phoneNumber": candidate["phoneNumber"],
             "flowReading": candidate["flowReading"],
             "firstMoraPattern": candidate["firstMoraPattern"],
             "secondMoraPattern": candidate["secondMoraPattern"],
+            "pairMoraPattern": candidate["pairMoraPattern"],
+            "pairEndingPattern": candidate["pairEndingPattern"],
+            "pairRhymePattern": candidate["pairRhymePattern"],
+            "soundScore": candidate["soundScore"],
             "soundSignals": candidate["soundSignals"],
+            "familyKey": candidate["familyKey"],
         }
-        for position, candidate in enumerate(direct.values(), start=1)
+        for position, candidate in enumerate(sound.values(), start=1)
+    ]
+    visual_records = [
+        {
+            "candidateId": candidate_id("V", position),
+            "phoneNumber": candidate["phoneNumber"],
+            "visualScore": candidate["visualScore"],
+            "visualSignals": candidate["visualSignals"],
+            "familyKey": candidate["familyKey"],
+        }
+        for position, candidate in enumerate(visual.values(), start=1)
     ]
     goroawase_records = [
         {
@@ -1003,6 +1190,10 @@ def write_compact_ai_inputs(
             "firstBlockHint": candidate["firstBlockHint"],
             "secondBlockHint": candidate["secondBlockHint"],
             "suggestedReading": candidate["suggestedReading"],
+            "hintScope": candidate["hintScope"],
+            "goroawaseScore": candidate["goroawaseScore"],
+            "goroawaseSignals": candidate["goroawaseSignals"],
+            "familyKey": candidate["familyKey"],
         }
         for position, candidate in enumerate(goroawase.values(), start=1)
     ]
@@ -1013,24 +1204,60 @@ def write_compact_ai_inputs(
             "flowReading": candidate["flowReading"],
             "firstMoraPattern": candidate["firstMoraPattern"],
             "secondMoraPattern": candidate["secondMoraPattern"],
+            "pairMoraPattern": candidate["pairMoraPattern"],
+            "pairEndingPattern": candidate["pairEndingPattern"],
+            "pairRhymePattern": candidate["pairRhymePattern"],
+            "soundScore": candidate["soundScore"],
             "soundSignals": candidate["soundSignals"],
+            "familyKey": candidate["familyKey"],
         }
         for position, candidate in enumerate(newly_found.values(), start=1)
     ]
     request = {
         "schemaVersion": CONTEXT_SCHEMA_VERSION,
+        "featureModelVersion": FEATURE_MODEL_VERSION,
         "sourceSnapshot": source_snapshot,
         "selectionCounts": selection_counts,
         "candidateCounts": {
-            "top": len(direct_records),
+            "top": len(sound_records),
+            "visual": len(visual_records),
             "goroawase": len(goroawase_records),
             "newlyFound": len(newly_found_records),
+        },
+        "diversityCaps": {
+            "top": FINAL_FAMILY_CAP,
+            "visual": FINAL_FAMILY_CAP,
+            "goroawase": FINAL_FAMILY_CAP,
+            "newlyFound": NEWLY_FOUND_FAMILY_CAP,
+        },
+        "diversityRequired": {
+            "top": bool(selection_counts["top"])
+            and family_cap_is_feasible(
+                sound, selection_counts["top"], FINAL_FAMILY_CAP
+            ),
+            "visual": bool(selection_counts["visual"])
+            and family_cap_is_feasible(
+                visual, selection_counts["visual"], FINAL_FAMILY_CAP
+            ),
+            "goroawase": bool(selection_counts["goroawase"])
+            and family_cap_is_feasible(
+                goroawase,
+                selection_counts["goroawase"],
+                FINAL_FAMILY_CAP,
+            ),
+            "newlyFound": bool(selection_counts["newlyFound"])
+            and family_cap_is_feasible(
+                newly_found,
+                selection_counts["newlyFound"],
+                NEWLY_FOUND_FAMILY_CAP,
+            ),
         },
     }
 
     # Publish the small request last so it serves as the completion marker for
-    # consumers downloading all four files from one artifact directory.
-    write_text_atomic(direct_output, compact_json_lines(direct_records))
+    # consumers downloading all five files from one artifact directory.
+    write_text_atomic(sound_output, compact_json_lines(sound_records))
+    write_text_atomic(visual_output, compact_json_lines(visual_records))
     write_text_atomic(goroawase_output, compact_json_lines(goroawase_records))
     write_text_atomic(newly_found_output, compact_json_lines(newly_found_records))
     write_text_atomic(
@@ -1045,6 +1272,7 @@ def load_context(
     dict[str, dict[str, object]],
     dict[str, dict[str, object]],
     dict[str, dict[str, object]],
+    dict[str, dict[str, object]],
     dict[str, int],
     tuple[str, ...],
     dict[str, object],
@@ -1056,17 +1284,20 @@ def load_context(
 
     root_fields = {
         "schemaVersion",
+        "featureModelVersion",
         "sourceSnapshot",
         "selectionCounts",
         "scope",
         "goroawaseCandidates",
-        "directCandidates",
+        "soundCandidates",
+        "visualCandidates",
         "newlyFoundCandidates",
     }
     if (
         not isinstance(payload, dict)
         or set(payload) != root_fields
         or payload["schemaVersion"] != CONTEXT_SCHEMA_VERSION
+        or payload["featureModelVersion"] != FEATURE_MODEL_VERSION
     ):
         raise DataError("candidate context has an unsupported schema")
     source_snapshot = payload["sourceSnapshot"]
@@ -1085,6 +1316,7 @@ def load_context(
     selection_counts = payload.get("selectionCounts")
     if not isinstance(selection_counts, dict) or set(selection_counts) != {
         "top",
+        "visual",
         "goroawase",
         "newlyFound",
     }:
@@ -1117,10 +1349,11 @@ def load_context(
         raise DataError("candidate context scope mode and masks disagree")
     if not specialized and (
         selection_counts["top"] != RANKING_LIMIT
+        or selection_counts["visual"] != RANKING_LIMIT
         or selection_counts["goroawase"] != RANKING_LIMIT
     ):
         raise DataError(
-            f"full-scan context must request both TOP-{RANKING_LIMIT} rankings"
+            f"full-scan context must request all TOP-{RANKING_LIMIT} rankings"
         )
 
     def make_index(
@@ -1131,7 +1364,8 @@ def load_context(
         if not isinstance(records, list):
             raise DataError(f"candidate context {key} must be an array")
         maximum = {
-            "directCandidates": MAX_DIRECT_CANDIDATES,
+            "soundCandidates": MAX_SOUND_CANDIDATES,
+            "visualCandidates": MAX_VISUAL_CANDIDATES,
             "goroawaseCandidates": MAX_GOROAWASE_CANDIDATES,
             "newlyFoundCandidates": MAX_NEWLY_FOUND_CANDIDATES,
         }[key]
@@ -1141,13 +1375,25 @@ def load_context(
         for position, item in enumerate(records):
             if not isinstance(item, dict):
                 raise DataError(f"{key} record {position} is not an object")
-            direct_fields = {
+            sound_fields = {
                 "phoneNumber",
                 "standardReading",
                 "flowReading",
                 "firstMoraPattern",
                 "secondMoraPattern",
+                "pairMoraPattern",
+                "pairEndingPattern",
+                "pairRhymePattern",
+                "soundScore",
                 "soundSignals",
+                "familyKey",
+            }
+            visual_fields = {
+                "phoneNumber",
+                "standardReading",
+                "visualScore",
+                "visualSignals",
+                "familyKey",
             }
             goroawase_fields = {
                 "phoneNumber",
@@ -1157,11 +1403,17 @@ def load_context(
                 "firstBlockHint",
                 "secondBlock",
                 "secondBlockHint",
-                "soundSignals",
+                "hintScope",
+                "goroawaseScore",
+                "goroawaseSignals",
+                "familyKey",
             }
-            expected_fields = (
-                goroawase_fields if key == "goroawaseCandidates" else direct_fields
-            )
+            if key == "goroawaseCandidates":
+                expected_fields = goroawase_fields
+            elif key == "visualCandidates":
+                expected_fields = visual_fields
+            else:
+                expected_fields = sound_fields
             if set(item) != expected_fields:
                 raise DataError(f"{key} record {position} has an invalid schema")
             phone = item["phoneNumber"]
@@ -1171,17 +1423,17 @@ def load_context(
             raw_number = raw_phone(phone)
             if not isinstance(reading, str) or reading != standard_reading(raw_number):
                 raise DataError(f"{key} record {position} has an invalid reading")
-            expected_signals = direct_features(
-                {"phoneNumber": phone, "standardReading": reading}
-            )[1]
-            signals = item["soundSignals"]
-            if (
-                not isinstance(signals, list)
-                or any(not isinstance(signal, str) for signal in signals)
-                or signals != expected_signals
-            ):
-                raise DataError(f"{key} record {position} has invalid sound signals")
-            if key != "goroawaseCandidates":
+            record = {"phoneNumber": phone, "standardReading": reading}
+            if key in {"soundCandidates", "newlyFoundCandidates"}:
+                expected_score, expected_signals = sound_features(record)
+                signals = item["soundSignals"]
+                if (
+                    item["soundScore"] != expected_score
+                    or not isinstance(signals, list)
+                    or any(not isinstance(signal, str) for signal in signals)
+                    or signals != expected_signals
+                ):
+                    raise DataError(f"{key} record {position} has invalid sound features")
                 if item["flowReading"] != flow_reading(raw_number):
                     raise DataError(
                         f"{key} record {position} has an invalid flow reading"
@@ -1194,6 +1446,27 @@ def load_context(
                     raise DataError(
                         f"{key} record {position} has an invalid second mora pattern"
                     )
+                first = raw_number[3:7]
+                second = raw_number[7:]
+                if item["pairMoraPattern"] != list(pair_mora_pattern(first, second)):
+                    raise DataError(f"{key} record {position} has an invalid pair mora pattern")
+                if item["pairEndingPattern"] != list(pair_ending_pattern(first, second)):
+                    raise DataError(f"{key} record {position} has an invalid pair ending pattern")
+                if item["pairRhymePattern"] != list(pair_rhyme_pattern(first, second)):
+                    raise DataError(f"{key} record {position} has an invalid pair rhyme pattern")
+                if item["familyKey"] != second:
+                    raise DataError(f"{key} record {position} has an invalid family")
+            elif key == "visualCandidates":
+                expected_score, expected_signals = visual_features(record)
+                signals = item["visualSignals"]
+                if (
+                    item["visualScore"] != expected_score
+                    or not isinstance(signals, list)
+                    or any(not isinstance(signal, str) for signal in signals)
+                    or signals != expected_signals
+                    or item["familyKey"] != raw_number[7:]
+                ):
+                    raise DataError(f"{key} record {position} has invalid visual features")
             else:
                 first = raw_number[3:7]
                 second = raw_number[7:]
@@ -1225,6 +1498,21 @@ def load_context(
                     raise DataError(
                         f"{key} record {position} has an invalid suggested reading"
                     )
+                expected_score, expected_signals, expected_scope, expected_family = (
+                    goroawase_features(record, first_hint, second_hint)
+                )
+                signals = item["goroawaseSignals"]
+                if (
+                    item["goroawaseScore"] != expected_score
+                    or item["hintScope"] != expected_scope
+                    or item["familyKey"] != expected_family
+                    or not isinstance(signals, list)
+                    or any(not isinstance(signal, str) for signal in signals)
+                    or signals != expected_signals
+                ):
+                    raise DataError(
+                        f"{key} record {position} has invalid goroawase features"
+                    )
             if phone in index:
                 raise DataError(f"duplicate {key} phone {phone}")
             index[phone] = item
@@ -1234,7 +1522,8 @@ def load_context(
             )
         return index
 
-    direct_index = make_index("directCandidates", selection_counts["top"])
+    sound_index = make_index("soundCandidates", selection_counts["top"])
+    visual_index = make_index("visualCandidates", selection_counts["visual"])
     goroawase_index = make_index(
         "goroawaseCandidates", selection_counts["goroawase"]
     )
@@ -1251,24 +1540,33 @@ def load_context(
             "candidate context must omit a newly-found shortlist smaller than 10"
         )
     expected_counts = {
-        "top": min(RANKING_LIMIT, len(direct_index)),
+        "top": min(RANKING_LIMIT, len(sound_index)),
+        "visual": min(RANKING_LIMIT, len(visual_index)),
         "goroawase": min(RANKING_LIMIT, len(goroawase_index)),
         "newlyFound": expected_new_selection_count,
     }
     if selection_counts != expected_counts:
         raise DataError("candidate context selection counts contradict candidates")
-    if len(direct_index) != min(snapshot_record_count, MAX_DIRECT_CANDIDATES):
+    if len(sound_index) != min(snapshot_record_count, MAX_SOUND_CANDIDATES):
         raise DataError(
-            "candidate context snapshot count contradicts direct candidates"
+            "candidate context snapshot count contradicts sound candidates"
+        )
+    if len(visual_index) != min(snapshot_record_count, MAX_VISUAL_CANDIDATES):
+        raise DataError(
+            "candidate context snapshot count contradicts visual candidates"
         )
     candidate_union = (
-        set(direct_index) | set(goroawase_index) | set(newly_found_index)
+        set(sound_index)
+        | set(visual_index)
+        | set(goroawase_index)
+        | set(newly_found_index)
     )
     if snapshot_record_count < len(candidate_union):
         raise DataError("candidate context snapshot count contradicts candidates")
 
     return (
-        direct_index,
+        sound_index,
+        visual_index,
         goroawase_index,
         newly_found_index,
         selection_counts,
@@ -1288,20 +1586,28 @@ def load_selection(
 
     if not isinstance(payload, dict) or set(payload) != {
         "top",
+        "visual",
         "goroawase",
         "newlyFound",
     }:
         raise DataError(
-            "selection must contain exactly top, goroawase, and newlyFound"
+            "selection must contain exactly top, visual, goroawase, and newlyFound"
         )
     top = payload["top"]
+    visual = payload["visual"]
     goroawase = payload["goroawase"]
     newly_found = payload["newlyFound"]
-    if not all(isinstance(value, list) for value in (top, goroawase, newly_found)):
-        raise DataError("top, goroawase, and newlyFound must all be arrays")
+    if not all(
+        isinstance(value, list) for value in (top, visual, goroawase, newly_found)
+    ):
+        raise DataError("top, visual, goroawase, and newlyFound must all be arrays")
     if len(top) != selection_counts["top"]:
         raise DataError(
             f"top must contain exactly {selection_counts['top']} entries"
+        )
+    if len(visual) != selection_counts["visual"]:
+        raise DataError(
+            f"visual must contain exactly {selection_counts['visual']} entries"
         )
     if len(goroawase) != selection_counts["goroawase"]:
         raise DataError(
@@ -1313,7 +1619,12 @@ def load_selection(
             "newlyFound must contain exactly "
             f"{selection_counts['newlyFound']} entries"
         )
-    return {"top": top, "goroawase": goroawase, "newlyFound": newly_found}
+    return {
+        "top": top,
+        "visual": visual,
+        "goroawase": goroawase,
+        "newlyFound": newly_found,
+    }
 
 
 def candidate_index_by_id(
@@ -1355,16 +1666,34 @@ def selected_candidate(
     return selected_id, phone, candidate
 
 
-def validate_direct_entries(
+def family_cap_is_feasible(
+    candidates: dict[str, dict[str, object]],
+    requested: int,
+    cap: int,
+) -> bool:
+    counts: dict[str, int] = {}
+    for candidate in candidates.values():
+        family = str(candidate["familyKey"])
+        counts[family] = counts.get(family, 0) + 1
+    return sum(min(count, cap) for count in counts.values()) >= requested
+
+
+def validate_standard_entries(
     entries: Iterable[object],
     candidates: dict[str, dict[str, object]],
     *,
     label: str,
     prefix: str,
+    family_cap: int,
 ) -> list[tuple[str, str]]:
     result: list[tuple[str, str]] = []
     seen: set[str] = set()
+    family_counts: dict[str, int] = {}
     candidates_by_id = candidate_index_by_id(candidates, prefix)
+    entries = list(entries)
+    enforce_family_cap = family_cap_is_feasible(
+        candidates, len(entries), family_cap
+    )
     for position, item in enumerate(entries, start=1):
         selected_id, phone, candidate = selected_candidate(
             item,
@@ -1375,6 +1704,12 @@ def validate_direct_entries(
         )
         if selected_id in seen:
             raise DataError(f"{label} contains duplicate candidateId {selected_id}")
+        family = str(candidate["familyKey"])
+        family_counts[family] = family_counts.get(family, 0) + 1
+        if enforce_family_cap and family_counts[family] > family_cap:
+            raise DataError(
+                f"{label} exceeds the {family_cap}-entry family diversity cap"
+            )
         seen.add(selected_id)
         result.append((phone, str(candidate["standardReading"])))
     return result
@@ -1384,7 +1719,26 @@ def validate_top_entries(
     entries: Iterable[object],
     candidates: dict[str, dict[str, object]],
 ) -> list[tuple[str, str]]:
-    return validate_direct_entries(entries, candidates, label="top", prefix="T")
+    return validate_standard_entries(
+        entries,
+        candidates,
+        label="top",
+        prefix="T",
+        family_cap=FINAL_FAMILY_CAP,
+    )
+
+
+def validate_visual_entries(
+    entries: Iterable[object],
+    candidates: dict[str, dict[str, object]],
+) -> list[tuple[str, str]]:
+    return validate_standard_entries(
+        entries,
+        candidates,
+        label="visual",
+        prefix="V",
+        family_cap=FINAL_FAMILY_CAP,
+    )
 
 
 def validate_goroawase_entries(
@@ -1393,8 +1747,13 @@ def validate_goroawase_entries(
 ) -> list[tuple[str, str]]:
     result: list[tuple[str, str]] = []
     seen: set[str] = set()
+    family_counts: dict[str, int] = {}
     forbidden = set("|[]<>\r\n") | {chr(96)}
     candidates_by_id = candidate_index_by_id(candidates, "G")
+    entries = list(entries)
+    enforce_family_cap = family_cap_is_feasible(
+        candidates, len(entries), FINAL_FAMILY_CAP
+    )
 
     for position, item in enumerate(entries, start=1):
         selected_id, phone, candidate = selected_candidate(
@@ -1407,6 +1766,12 @@ def validate_goroawase_entries(
         if selected_id in seen:
             raise DataError(
                 f"goroawase contains duplicate candidateId {selected_id}"
+            )
+        family = str(candidate["familyKey"])
+        family_counts[family] = family_counts.get(family, 0) + 1
+        if enforce_family_cap and family_counts[family] > FINAL_FAMILY_CAP:
+            raise DataError(
+                "goroawase exceeds the 3-entry family diversity cap"
             )
         reading = candidate.get("suggestedReading")
         if (
@@ -1443,11 +1808,13 @@ def validate_selection(
     list[tuple[str, str]],
     list[tuple[str, str]],
     list[tuple[str, str]],
+    list[tuple[str, str]],
     tuple[str, ...],
 ]:
     """Validate one AI selection and resolve its IDs to trusted context rows."""
     (
-        direct_candidates,
+        sound_candidates,
+        visual_candidates,
         goroawase_candidates,
         newly_found_candidates,
         selection_counts,
@@ -1466,7 +1833,8 @@ def validate_selection(
         raise DataError("current snapshot does not match the candidate context count")
     current_phones = {record["phoneNumber"] for record in current_records}
     candidate_phones = (
-        set(direct_candidates)
+        set(sound_candidates)
+        | set(visual_candidates)
         | set(goroawase_candidates)
         | set(newly_found_candidates)
     )
@@ -1475,17 +1843,27 @@ def validate_selection(
             "candidate context contains a phone absent from current snapshot"
         )
     selection = load_selection(selection_path, selection_counts)
-    top_rows = validate_top_entries(selection["top"], direct_candidates)
+    top_rows = validate_top_entries(selection["top"], sound_candidates)
+    visual_rows = validate_visual_entries(
+        selection["visual"], visual_candidates
+    )
     goroawase_rows = validate_goroawase_entries(
         selection["goroawase"], goroawase_candidates
     )
-    newly_found_rows = validate_direct_entries(
+    newly_found_rows = validate_standard_entries(
         selection["newlyFound"],
         newly_found_candidates,
         label="newlyFound",
         prefix="N",
+        family_cap=NEWLY_FOUND_FAMILY_CAP,
     )
-    return top_rows, goroawase_rows, newly_found_rows, specialized_masks
+    return (
+        top_rows,
+        visual_rows,
+        goroawase_rows,
+        newly_found_rows,
+        specialized_masks,
+    )
 
 
 def display_reading(phone: str, reading: str) -> str:
@@ -1689,6 +2067,7 @@ def render_outputs(
 
     (
         top_rows,
+        visual_rows,
         goroawase_rows,
         newly_found_rows,
         specialized_masks,
@@ -1701,11 +2080,15 @@ def render_outputs(
         notice = specialized_notice(specialized_masks, rounds) + "\n"
 
     top_heading = ranking_heading(len(top_rows), "音と読みやすさ")
+    visual_heading = ranking_heading(len(visual_rows), "見た目・数字構造")
     goroawase_heading = ranking_heading(len(goroawase_rows), "語呂合わせ")
     top_body = (
         f"# {top_heading}\n\n"
         + notice
         + markdown_table(top_rows)
+        + "\n\n"
+        + f"## {visual_heading}\n\n"
+        + markdown_table(visual_rows)
         + "\n"
     )
     goroawase_body = (
@@ -1720,16 +2103,19 @@ def render_outputs(
         + "Codex が今回の実行で実際に観測された番号だけから"
         "選び、公開前に現在のスナップショットとの一致、番号、通常読みを"
         "自動検証しています。\n\n"
-        f"## {top_heading}\n\n"
+        + f"## {top_heading}\n\n"
         + markdown_table(top_rows)
         + "\n\n"
-        f"## {goroawase_heading}\n\n"
+        + f"## {visual_heading}\n\n"
+        + markdown_table(visual_rows)
+        + "\n\n"
+        + f"## {goroawase_heading}\n\n"
         + markdown_table(goroawase_rows)
         + "\n"
     )
     if newly_found_rows:
         new_heading = ranking_heading(
-            len(newly_found_rows), "前回スナップショットからの追加（音と読みやすさ）"
+            len(newly_found_rows), "新しく見つかった番号（音と読みやすさ）"
         )
         release_body += (
             f"\n## {new_heading}\n\n"
@@ -1778,7 +2164,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compact.add_argument("--context", type=Path, required=True)
     compact.add_argument("--request-output", type=Path, required=True)
-    compact.add_argument("--direct-output", type=Path, required=True)
+    compact.add_argument("--sound-output", type=Path, required=True)
+    compact.add_argument("--visual-output", type=Path, required=True)
     compact.add_argument("--goroawase-output", type=Path, required=True)
     compact.add_argument("--newly-found-output", type=Path, required=True)
 
@@ -1821,7 +2208,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_compact_ai_inputs(
                 context_path=args.context,
                 request_output=args.request_output,
-                direct_output=args.direct_output,
+                sound_output=args.sound_output,
+                visual_output=args.visual_output,
                 goroawase_output=args.goroawase_output,
                 newly_found_output=args.newly_found_output,
             )

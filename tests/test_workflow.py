@@ -493,6 +493,7 @@ class WorkflowTests(unittest.TestCase):
         for block in (
             "<ranking-request-json>",
             "<top-candidates-jsonl>",
+            "<visual-candidates-jsonl>",
             "<goroawase-candidates-jsonl>",
             "<newly-found-candidates-jsonl>",
         ):
@@ -559,7 +560,8 @@ class WorkflowTests(unittest.TestCase):
         for internal in (
             "top-candidates.json",
             "top-selection-request.json",
-            "top-direct-candidates.jsonl",
+            "top-sound-candidates.jsonl",
+            "top-visual-candidates.jsonl",
             "top-goroawase-candidates.jsonl",
             "top-newly-found-candidates.jsonl",
             "top-selection.json",
@@ -672,10 +674,12 @@ assets=(
         self.assertEqual(schema["type"], "object")
         self.assertFalse(schema["additionalProperties"])
         self.assertEqual(
-            set(schema["required"]), {"top", "goroawase", "newlyFound"}
+            set(schema["required"]),
+            {"top", "visual", "goroawase", "newlyFound"},
         )
         expected = {
             "top": "^T[0-9]{3}$",
+            "visual": "^V[0-9]{3}$",
             "goroawase": "^G[0-9]{3}$",
             "newlyFound": "^N[0-9]{3}$",
         }

@@ -3,7 +3,7 @@
 [日本語](README.md) | [English](README_EN.md)
 
 **raku-mobi-bangou** collects Japanese mobile-number candidates by four-digit
-mask and ranks ordinary spoken sound separately from goroawase.
+mask and ranks spoken sound, visual digit structure, and goroawase separately.
 
 ## Quick start
 
@@ -85,7 +85,7 @@ the endpoint.
 | `run/lifecycle.csv` | State of every known phone, including tombstones |
 | `run/lifecycle_events.csv` | Audit log of state changes and reappearances |
 | `run/logs/` | Complete collector and error logs |
-| `run/TOP.md` | Ordinary sound and readability ranking |
+| `run/TOP.md` | Sound/readability and visual-structure rankings |
 | `run/GOROAWASE.md` | Goroawase ranking |
 
 Actions artifacts retain the collection results, diff and coverage diagnostics,
@@ -122,18 +122,22 @@ Only phones in the current `run/all_numbers.csv` are eligible for ranking:
 
 - **TOP 30 — sound and readability**: smooth standard digit reading, rhythm,
   auditory clarity, and memorability
+- **TOP 30 — visual digit structure**: clear repetition, palindromes, mirrors,
+  sequences, and cross-block patterns
 - **TOP 30 — goroawase**: Japanese wordplay using readings from
   [masks.txt](masks.txt)
-- **TOP 10 — added since the previous snapshot**: ordinary-sound ranking of
-  phones absent from the previous snapshot for the same scope; shown in release notes
-  only when at least ten candidates exist
+- **TOP 10 — newly found numbers**: ordinary-sound ranking of
+  phones absent from the previous snapshot for the same scope; shown in release
+  notes only when at least ten candidates exist
 
-A full scan selects 30 entries for each main ranking. A specialized run uses all
-available candidates when fewer than 30 exist.
+A full scan selects 30 entries for each of the three main rankings. A specialized
+run uses all available candidates when fewer than 30 exist.
 
-Codex ranks candidate IDs only. Python resolves them against the current
-snapshot, validates IDs, counts, and readings, and renders Markdown. An invalid
-selection gets up to three attempts.
+Python builds separate reproducible sound and visual shortlists and limits
+overrepresentation by one mask family. Codex ranks candidate IDs only. Python
+resolves them against the current snapshot, validates IDs, counts, readings, and
+family caps, then renders Markdown. An invalid selection gets up to three
+attempts.
 
 Collection, ranking, and publication are separate jobs. If ranking fails,
 **Re-run failed jobs** reuses the collection artifact without calling the

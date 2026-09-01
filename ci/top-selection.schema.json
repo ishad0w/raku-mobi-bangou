@@ -4,6 +4,7 @@
   "additionalProperties": false,
   "required": [
     "top",
+    "visual",
     "goroawase",
     "newlyFound"
   ],
@@ -13,6 +14,13 @@
       "maxItems": 30,
       "items": {
         "$ref": "#/$defs/topEntry"
+      }
+    },
+    "visual": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "$ref": "#/$defs/visualEntry"
       }
     },
     "goroawase": {
@@ -41,6 +49,19 @@
         "candidateId": {
           "type": "string",
           "pattern": "^T[0-9]{3}$"
+        }
+      }
+    },
+    "visualEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidateId"
+      ],
+      "properties": {
+        "candidateId": {
+          "type": "string",
+          "pattern": "^V[0-9]{3}$"
         }
       }
     },

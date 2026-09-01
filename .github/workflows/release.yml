@@ -578,7 +578,8 @@ jobs:
           python3 ci/top_tables.py compact \
             --context run/top-candidates.json \
             --request-output run/ai/top-selection-request.json \
-            --direct-output run/ai/top-direct-candidates.jsonl \
+            --sound-output run/ai/top-sound-candidates.jsonl \
+            --visual-output run/ai/top-visual-candidates.jsonl \
             --goroawase-output run/ai/top-goroawase-candidates.jsonl \
             --newly-found-output run/ai/top-newly-found-candidates.jsonl
 
@@ -664,8 +665,10 @@ jobs:
             printf '%s\n' '<ranking-request-json>'
             cat -- run/ai/top-selection-request.json
             printf '%s\n' '</ranking-request-json>' '<top-candidates-jsonl>'
-            cat -- run/ai/top-direct-candidates.jsonl
-            printf '%s\n' '</top-candidates-jsonl>' '<goroawase-candidates-jsonl>'
+            cat -- run/ai/top-sound-candidates.jsonl
+            printf '%s\n' '</top-candidates-jsonl>' '<visual-candidates-jsonl>'
+            cat -- run/ai/top-visual-candidates.jsonl
+            printf '%s\n' '</visual-candidates-jsonl>' '<goroawase-candidates-jsonl>'
             cat -- run/ai/top-goroawase-candidates.jsonl
             printf '%s\n' '</goroawase-candidates-jsonl>' '<newly-found-candidates-jsonl>'
             cat -- run/ai/top-newly-found-candidates.jsonl
